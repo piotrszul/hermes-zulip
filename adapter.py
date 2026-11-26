@@ -5,11 +5,19 @@ long-polling stream. No external Zulip library is required - everything is
 driven through ``aiohttp`` (already a Hermes dependency), mirroring the
 Mattermost adapter's transport strategy.
 
-Conversations are keyed by chat IDs (JIDs) of the following form, so each
-stream topic and each direct-message partner gets its own session:
+Zulip topics are presented to Hermes as threads, like Slack threads:
 
-* Stream topic  -> ``zulip:{stream_id}:{topic}``
-* Direct message -> ``zulip:dm:{user_id}``
+* Channel (stream) -> chat ID ``zulip:{stream_id}``; each topic is a thread,
+  carried as ``thread_id`` (the topic name), so each topic gets its own session.
+* Direct message   -> chat ID ``zulip:dm:{user_id}``
+
+The older ``zulip:{stream_id}:{topic}`` form is still accepted as a target.
+
+Mention gating follows Slack: in a topic where the bot has posted, every
+message reaches Hermes; elsewhere in a channel the bot needs an @-mention.
+A cron job that delivers to a channel (``zulip:{stream_id}`` or
+``zulip:{channel name}``) opens a fresh topic per run, named after the job
+and the host's local time.
 
 Environment variables:
 
@@ -20,9 +28,11 @@ Environment variables:
                              messages from other streams are ignored.
     ZULIP_ALLOWED_USERS      Comma-separated Zulip user IDs allowed to talk
     ZULIP_ALLOW_ALL_USERS    Allow any Zulip user (dev only)
-    ZULIP_HOME_CHANNEL       Home JID for cron / notification delivery
-    ZULIP_REQUIRE_MENTION    Require @mention in streams (default true)
-    ZULIP_FREE_RESPONSE_TOPICS  Topics where @mention is not required
+    ZULIP_HOME_CHANNEL       Optional home target for status notices and cron
+                             jobs with no explicit target. Unset = no notices.
+    ZULIP_REQUIRE_MENTION    Require @mention in topics the bot has not posted
+                             in (default true)
+    ZULIP_FREE_RESPONSE_TOPICS  Extra topics where @mention is never required
 
 Author: John Grimes
 """
@@ -35,6 +45,7 @@ import html as html_lib
 import logging
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -62,6 +73,20 @@ logger = logging.getLogger(__name__)
 # Zulip's hard per-message limit is 10000 characters. Chunk above it so
 # long agent responses are delivered in full rather than rejected.
 MAX_MESSAGE_LENGTH = 10000
+
+# Zulip's default limit on topic names (server setting max_topic_length).
+MAX_TOPIC_LENGTH = 60
+
+# Topic used when a message goes to a channel with no topic (e.g. a status
+# notice to a channel-only home target).
+DEFAULT_TOPIC = "Hermes"
+
+# Hermes core names cron/handoff threads "Hermes — <job name>".
+_THREAD_NAME_PREFIX_RE = re.compile(r"^\s*Hermes\s*[—–-]\s*")
+
+# Channel name (lower case) -> stream id. Filled on connect from the bot's
+# subscriptions, and on demand when a target names an unknown channel.
+_STREAM_IDS_BY_NAME: Dict[str, int] = {}
 
 # Reconnect backoff for the event-polling loop.
 _RECONNECT_BASE_DELAY = 2.0
@@ -101,7 +126,8 @@ def check_zulip_requirements() -> bool:
 def parse_jid(jid: str) -> Optional[Dict[str, Any]]:
     """Parse a Zulip JID into its routing components.
 
-    @param jid - The JID string ("zulip:{stream_id}:{topic}" or "zulip:dm:{user_id}").
+    @param jid - "zulip:{stream_id}", "zulip:{stream_id}:{topic}" or "zulip:dm:{user_id}".
+        A channel-only JID parses with ``topic`` None.
     @returns A dict describing the target, or None if the JID is not a valid Zulip JID.
     """
     if not jid.startswith("zulip:"):
@@ -116,7 +142,10 @@ def parse_jid(jid: str) -> Optional[Dict[str, Any]]:
 
     colon_idx = rest.find(":")
     if colon_idx == -1:
-        return None
+        stream_id = parseIntSafe(rest)
+        if stream_id is None:
+            return None
+        return {"type": "stream", "stream_id": stream_id, "topic": None}
     stream_id = parseIntSafe(rest[:colon_idx])
     if stream_id is None:
         return None
@@ -127,23 +156,113 @@ def parse_jid(jid: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_target_ref(target_ref: str) -> Optional[Tuple[str, Optional[str]]]:
-    """Turn a delivery target into a Zulip JID for Hermes's target resolution.
+    """Turn a delivery target into a (chat ID, thread ID) pair for Hermes.
 
     Hermes splits ``deliver`` / ``send_message`` targets as ``platform:rest`` and
     passes only ``rest`` on, so ``zulip:42:general`` arrives here as
-    ``42:general``. Restore the ``zulip:`` prefix the adapter's JIDs carry, so
-    cron delivery reaches the right topic and the brief is seeded into the
-    same session that replies in that topic use.
+    ``42:general``. The channel becomes the chat ID and the topic the thread
+    ID, matching what inbound messages carry, so a cron brief is seeded into
+    the same session that replies in its topic use.
+
+    Accepted forms (the ``zulip:`` prefix is optional):
+    ``42``, ``42:topic``, ``briefs``, ``briefs:topic`` and ``dm:7``.
+    A channel with no topic gets a fresh topic per cron run.
 
     @param target_ref - The target with or without the ``zulip:`` prefix.
-    @returns ``(jid, None)`` for a stream topic or DM target, or None to let
-        Hermes fall back to channel-name resolution.
+    @returns ``(chat_id, topic or None)``, or None to let Hermes fall back to its
+        own channel-name resolution.
     """
     ref = (target_ref or "").strip()
-    jid = ref if ref.startswith("zulip:") else f"zulip:{ref}"
-    if parse_jid(jid) is None:
+    if ref.startswith("zulip:"):
+        ref = ref[len("zulip:"):]
+    if ref.startswith("dm:"):
+        jid = f"zulip:{ref}"
+        return (jid, None) if parse_jid(jid) else None
+    head, sep, topic = ref.partition(":")
+    head = head.strip()
+    if not head or (sep and not topic):
         return None
-    return jid, None
+    stream_id = parseIntSafe(head)
+    if stream_id is None:
+        stream_id = _stream_id_for_name(head)
+        if stream_id is None:
+            return None
+    return f"zulip:{stream_id}", (topic or None)
+
+
+def _stream_id_for_name(name: str) -> Optional[int]:
+    """Look up a channel ID by name (case-insensitive), refreshing on a miss."""
+    key = name.strip().lower()
+    if key not in _STREAM_IDS_BY_NAME:
+        _STREAM_IDS_BY_NAME.update(_fetch_stream_ids_sync())
+    return _STREAM_IDS_BY_NAME.get(key)
+
+
+def _fetch_stream_ids_sync() -> Dict[str, int]:
+    """Fetch the bot's subscribed channels as {lower-case name: id}.
+
+    Synchronous because Hermes's target parser is synchronous. It only runs
+    when a target names a channel not yet seen; the gateway fills the cache on
+    connect. Returns {} on any failure.
+    """
+    import json
+    import urllib.request
+
+    site = get_scoped_secret("ZULIP_SITE", "", external_fallback=True).rstrip("/")
+    email = get_scoped_secret("ZULIP_BOT_EMAIL", "", external_fallback=True)
+    api_key = get_scoped_secret("ZULIP_BOT_API_KEY", "", external_fallback=True)
+    if not site or not email or not api_key:
+        return {}
+    auth = "Basic " + base64.b64encode(f"{email}:{api_key}".encode("utf-8")).decode("ascii")
+    request = urllib.request.Request(
+        f"{site}/api/v1/users/me/subscriptions", headers={"Authorization": auth})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as resp:  # noqa: S310 (configured site)
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logger.warning("Zulip: could not list channels to resolve a target: %s", exc)
+        return {}
+    return _stream_ids_from_subscriptions(body)
+
+
+def _stream_ids_from_subscriptions(body: Dict[str, Any]) -> Dict[str, int]:
+    if body.get("result") != "success":
+        return {}
+    return {
+        str(sub["name"]).lower(): int(sub["stream_id"])
+        for sub in body.get("subscriptions", [])
+        if sub.get("name") and sub.get("stream_id") is not None
+    }
+
+
+def _local_now() -> datetime:
+    """The host's local time (patched in tests)."""
+    return datetime.now()
+
+
+def make_topic_name(thread_name: str, now: datetime, existing_topics: List[str]) -> str:
+    """Name a fresh topic for a cron run: ``<job name> · YYYY-MM-DD HH:MM``.
+
+    Zulip appends to a topic that already exists (topic names are
+    case-insensitive), so a taken name gets `` (2)``, `` (3)`` and so on. The
+    job name is shortened to keep the whole name within Zulip's topic limit.
+
+    @param thread_name - The name Hermes passes, e.g. "Hermes — Morning brief".
+    @param now - The run time, in the host's local time.
+    @param existing_topics - Topic names already in the channel.
+    """
+    base = _THREAD_NAME_PREFIX_RE.sub("", thread_name or "").strip() or DEFAULT_TOPIC
+    taken = {t.lower() for t in existing_topics}
+    stamp = f" · {now:%Y-%m-%d %H:%M}"
+    counter = 1
+    while True:
+        suffix = stamp if counter == 1 else f"{stamp} ({counter})"
+        room = MAX_TOPIC_LENGTH - len(suffix)
+        label = base if len(base) <= room else base[: room - 1].rstrip() + "…"
+        name = label + suffix
+        if name.lower() not in taken:
+            return name
+        counter += 1
 
 
 def parseIntSafe(value: str) -> Optional[int]:
@@ -154,12 +273,16 @@ def parseIntSafe(value: str) -> Optional[int]:
         return None
 
 
-def build_send_params(jid: str, content: str) -> Optional[Dict[str, Any]]:
+def build_send_params(
+    jid: str, content: str, topic: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Build a Zulip POST /messages payload from a JID and message text.
 
-    @param jid - The target JID.
+    @param jid - The target JID (channel, legacy channel+topic, or DM).
     @param content - The message content (Zulip markdown).
-    @returns The JSON payload for POST /api/v1/messages, or None for an invalid JID.
+    @param topic - The topic (Hermes thread ID). Wins over a topic in the JID;
+        a channel with neither uses ``DEFAULT_TOPIC``.
+    @returns The payload for POST /api/v1/messages, or None for an invalid JID.
     """
     parsed = parse_jid(jid)
     if not parsed:
@@ -168,7 +291,7 @@ def build_send_params(jid: str, content: str) -> Optional[Dict[str, Any]]:
         return {
             "type": "stream",
             "to": parsed["stream_id"],
-            "topic": parsed["topic"],
+            "topic": topic or parsed["topic"] or DEFAULT_TOPIC,
             "content": content,
         }
     return {
@@ -318,6 +441,37 @@ class ZulipAdapter(BasePlatformAdapter):
 
         self._dedup = MessageDeduplicator()
 
+        # Slack-like following: (stream_id, lower-case topic) -> whether the
+        # bot has posted there. Learned from the bot's own messages and sends,
+        # and from one Zulip lookup per topic after a restart.
+        self._topic_activity: Dict[Tuple[int, str], bool] = {}
+
+    @property
+    def _active_topics(self) -> set:
+        return {key for key, active in self._topic_activity.items() if active}
+
+    def _mark_topic_active(self, stream_id: Any, topic: Optional[str]) -> None:
+        if stream_id is not None and topic:
+            self._topic_activity[(int(stream_id), topic.lower())] = True
+
+    async def _bot_active_in_topic(self, stream_id: int, topic: str) -> bool:
+        """Whether the bot has posted in a topic (asks Zulip once per topic)."""
+        key = (int(stream_id), topic.lower())
+        if key not in self._topic_activity:
+            narrow = [
+                {"operator": "stream", "operand": int(stream_id)},
+                {"operator": "topic", "operand": topic},
+                {"operator": "sender", "operand": self._bot_user_id},
+            ]
+            found = await self._api_get("messages", {
+                "anchor": "newest", "num_before": 1, "num_after": 0,
+                "narrow": json_dumps(narrow), "apply_markdown": "false",
+            })
+            if found.get("result") != "success":
+                return False  # don't cache failures; ask again next time
+            self._topic_activity[key] = bool(found.get("messages"))
+        return self._topic_activity[key]
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
@@ -432,6 +586,9 @@ class ZulipAdapter(BasePlatformAdapter):
             self._site,
         )
 
+        subs = await self._api_get("users/me/subscriptions")
+        _STREAM_IDS_BY_NAME.update(_stream_ids_from_subscriptions(subs))
+
         if self._stream_name:
             resolved = await self._api_get(
                 "get_stream_id", {"stream": self._stream_name}
@@ -477,9 +634,13 @@ class ZulipAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
 
-        params = build_send_params(chat_id, self.format_message(content))
+        topic = (metadata or {}).get("thread_id")
+        params = build_send_params(
+            chat_id, self.format_message(content), topic=str(topic) if topic else None)
         if not params:
             return SendResult(success=False, error=f"Invalid Zulip JID: {chat_id}")
+        if params["type"] == "stream":
+            self._mark_topic_active(params["to"], params["topic"])
 
         chunks = self.truncate_message(params["content"], MAX_MESSAGE_LENGTH)
         last_id: Optional[str] = None
@@ -506,10 +667,27 @@ class ZulipAdapter(BasePlatformAdapter):
             name = info.get("user", {}).get("full_name", chat_id) if info.get("result") == "success" else chat_id
             return {"name": name, "type": "dm"}
         stream_name = await self._stream_name_for_id(parsed["stream_id"])
-        return {
-            "name": f"{stream_name} > {parsed['topic']}",
-            "type": "group",
-        }
+        name = f"{stream_name} > {parsed['topic']}" if parsed["topic"] else stream_name
+        return {"name": name, "type": "group"}
+
+    async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
+        """Open a fresh topic in a channel for a cron run or session handoff.
+
+        A Zulip topic exists once something is posted to it, so this only picks
+        a name no topic in the channel uses yet; Hermes then sends to it as the
+        thread ID. A run that ends silent leaves no empty topic behind.
+
+        @returns The new topic name, or None for a DM or an invalid chat ID.
+        """
+        parsed = parse_jid(parent_chat_id)
+        if not parsed or parsed["type"] != "stream":
+            return None
+        stream_id = parsed["stream_id"]
+        found = await self._api_get(f"users/me/{stream_id}/topics")
+        existing = [t.get("name", "") for t in found.get("topics", [])] if found.get("result") == "success" else []
+        topic = make_topic_name(name, _local_now(), existing)
+        self._mark_topic_active(stream_id, topic)
+        return topic
 
     # ------------------------------------------------------------------
     # Optional overrides
@@ -749,8 +927,12 @@ class ZulipAdapter(BasePlatformAdapter):
         if not msg:
             return
 
-        # Skip our own messages to avoid reply loops.
+        # Skip our own messages to avoid reply loops, but remember the topic:
+        # the bot follows every topic it has posted in (including posts from
+        # an out-of-process cron send).
         if self._bot_user_id is not None and msg.get("sender_id") == self._bot_user_id:
+            if msg.get("type") == "stream":
+                self._mark_topic_active(msg.get("stream_id"), msg.get("subject"))
             return
 
         is_stream = msg.get("type") == "stream"
@@ -762,11 +944,13 @@ class ZulipAdapter(BasePlatformAdapter):
             topic = msg.get("subject") or ""
             if not topic:
                 return
-            chat_jid = f"zulip:{stream_id}:{topic}"
-            chat_type = "group"
+            chat_jid = f"zulip:{stream_id}"
+            chat_type = "thread"
+            thread_id: Optional[str] = topic
         else:
             chat_jid = f"zulip:dm:{msg.get('sender_id')}"
             chat_type = "dm"
+            thread_id = None
 
         # Mention gating for stream messages. DMs always pass through.
         text = html_to_text(msg.get("content", ""))
@@ -788,8 +972,13 @@ class ZulipAdapter(BasePlatformAdapter):
                 self._bot_user_id,
                 mention_tokens,
             )
-            if require_mention and topic not in free_topics and not has_mention:
-                logger.debug("Zulip: skipping stream message without @mention (%s)", chat_jid)
+            if (
+                require_mention
+                and not has_mention
+                and topic not in free_topics
+                and not await self._bot_active_in_topic(stream_id, topic)
+            ):
+                logger.debug("Zulip: skipping message without @mention in a quiet topic (%s)", chat_jid)
                 return
             if has_mention:
                 text = strip_mention(text, mention_tokens)
@@ -836,6 +1025,8 @@ class ZulipAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=str(msg.get("sender_id", "")) or None,
             user_name=msg.get("sender_full_name", ""),
+            thread_id=thread_id,
+            chat_topic=thread_id,
             message_id=msg_id,
         )
 
@@ -941,7 +1132,7 @@ async def _standalone_send(
     auth = "Basic " + base64.b64encode(f"{email}:{api_key}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": auth}
 
-    params = build_send_params(chat_id, message)
+    params = build_send_params(chat_id, message, topic=thread_id)
     if not params:
         return {"error": f"Invalid Zulip JID: {chat_id}"}
 

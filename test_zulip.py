@@ -31,13 +31,17 @@ html_to_text = adapter.html_to_text
 parse_jid = adapter.parse_jid
 strip_mention = adapter.strip_mention
 is_bot_mentioned = adapter.is_bot_mentioned
-parse_target_ref = getattr(adapter, "parse_target_ref", None)
+parse_target_ref = adapter.parse_target_ref
+make_topic_name = adapter.make_topic_name
 
 
 class TestParseJid:
     def test_stream_jid_parses_to_stream_id_and_topic(self):
         parsed = parse_jid("zulip:42:general")
         assert parsed == {"type": "stream", "stream_id": 42, "topic": "general"}
+
+    def test_channel_jid_has_no_topic(self):
+        assert parse_jid("zulip:42") == {"type": "stream", "stream_id": 42, "topic": None}
 
     def test_dm_jid_parses_to_user_id(self):
         parsed = parse_jid("zulip:dm:7")
@@ -70,28 +74,68 @@ class TestParseJid:
 
 class TestParseTargetRef:
     """Hermes strips the platform prefix from delivery targets ("zulip:42:general"
-    reaches the plugin as "42:general"), so the parser restores the full JID."""
+    reaches the plugin as "42:general"); the parser returns (channel JID, topic)."""
+
+    @pytest.fixture(autouse=True)
+    def _streams(self, monkeypatch):
+        monkeypatch.setattr(adapter, "_STREAM_IDS_BY_NAME", {"briefs": 659014})
+        monkeypatch.setattr(adapter, "_fetch_stream_ids_sync", lambda: {})
 
     def test_stream_topic_without_prefix(self):
-        assert parse_target_ref("659014:Morning brief") == ("zulip:659014:Morning brief", None)
+        assert parse_target_ref("659014:Morning brief") == ("zulip:659014", "Morning brief")
+
+    def test_channel_only(self):
+        assert parse_target_ref("659014") == ("zulip:659014", None)
 
     def test_dm_without_prefix(self):
         assert parse_target_ref("dm:7") == ("zulip:dm:7", None)
 
-    def test_full_jid_passes_through(self):
-        assert parse_target_ref("zulip:42:general") == ("zulip:42:general", None)
+    def test_full_legacy_jid(self):
+        assert parse_target_ref("zulip:42:general") == ("zulip:42", "general")
 
     def test_topic_with_colons(self):
-        assert parse_target_ref("42:a:b") == ("zulip:42:a:b", None)
+        assert parse_target_ref("42:a:b") == ("zulip:42", "a:b")
 
     def test_surrounding_whitespace_is_ignored(self):
-        assert parse_target_ref("  42:general ") == ("zulip:42:general", None)
+        assert parse_target_ref("  42:general ") == ("zulip:42", "general")
 
-    def test_channel_name_is_left_to_core_resolution(self):
-        assert parse_target_ref("briefs") is None
+    def test_channel_name(self):
+        assert parse_target_ref("briefs") == ("zulip:659014", None)
+
+    def test_channel_name_is_case_insensitive_and_takes_topic(self):
+        assert parse_target_ref("Briefs:Status") == ("zulip:659014", "Status")
+
+    def test_unknown_channel_name_is_left_to_core_resolution(self):
+        assert parse_target_ref("nowhere") is None
 
     def test_missing_topic_is_not_a_target(self):
         assert parse_target_ref("42:") is None
+
+
+class TestMakeTopicName:
+    NOW = __import__("datetime").datetime(2026, 11, 27, 6, 0)
+
+    def test_job_name_and_local_time(self):
+        assert make_topic_name("Hermes — Morning brief", self.NOW, []) == "Morning brief · 2026-11-27 06:00"
+
+    def test_name_without_hermes_prefix(self):
+        assert make_topic_name("Status", self.NOW, []) == "Status · 2026-11-27 06:00"
+
+    def test_existing_name_gets_a_counter(self):
+        existing = ["morning brief · 2026-11-27 06:00"]  # Zulip topics are case-insensitive
+        assert make_topic_name("Hermes — Morning brief", self.NOW, existing) == "Morning brief · 2026-11-27 06:00 (2)"
+
+    def test_counter_skips_taken_numbers(self):
+        existing = ["Morning brief · 2026-11-27 06:00", "Morning brief · 2026-11-27 06:00 (2)"]
+        assert make_topic_name("Hermes — Morning brief", self.NOW, existing).endswith("(3)")
+
+    def test_empty_name_falls_back_to_default(self):
+        assert make_topic_name("Hermes — ", self.NOW, []) == "Hermes · 2026-11-27 06:00"
+
+    def test_long_name_fits_zulip_limit_and_keeps_time(self):
+        name = make_topic_name("Hermes — " + "x" * 100, self.NOW, [])
+        assert len(name) <= adapter.MAX_TOPIC_LENGTH == 60
+        assert name.endswith("2026-11-27 06:00")
 
 
 class TestBuildSendParams:
@@ -114,6 +158,18 @@ class TestBuildSendParams:
 
     def test_invalid_jid_returns_none(self):
         assert build_send_params("telegram:1", "hello") is None
+
+    def test_channel_jid_takes_topic_argument(self):
+        params = build_send_params("zulip:42", "hello", topic="Morning brief")
+        assert params["to"] == 42 and params["topic"] == "Morning brief"
+
+    def test_topic_argument_overrides_legacy_jid_topic(self):
+        params = build_send_params("zulip:42:general", "hello", topic="other")
+        assert params["topic"] == "other"
+
+    def test_channel_without_topic_uses_default_topic(self):
+        params = build_send_params("zulip:42", "hello")
+        assert params["topic"] == adapter.DEFAULT_TOPIC == "Hermes"
 
 
 class TestHtmlToText:
@@ -350,3 +406,218 @@ class TestEnvEnablement:
     def test_unconfigured_returns_none(self, monkeypatch):
         monkeypatch.delenv("ZULIP_BOT_API_KEY")
         assert adapter._env_enablement() is None
+
+
+    def test_thread_id_sets_topic(self, monkeypatch):
+        import asyncio
+        import sys
+        import types
+
+        fake_aiohttp = types.ModuleType("aiohttp")
+        fake_aiohttp.ClientSession = _FakeSession
+        fake_aiohttp.ClientTimeout = lambda **kwargs: None
+        fake_aiohttp.ClientError = type("ClientError", (Exception,), {})
+        monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+
+        _FakeSession.calls = []
+        result = asyncio.run(
+            adapter._standalone_send(_PConfig(), "zulip:42", "hello", thread_id="Morning brief · 2026-11-27 06:00"))
+        assert result.get("success") is True, result
+        assert _FakeSession.calls[-1]["data"]["topic"] == "Morning brief · 2026-11-27 06:00"
+
+
+# ---------------------------------------------------------------------------
+# Adapter behaviour against a fake Zulip API
+# ---------------------------------------------------------------------------
+
+BOT_ID = 99
+OWNER_ID = 1240272
+
+
+class _FakeApi:
+    """Records adapter API calls and answers them from canned data."""
+
+    def __init__(self, bot_posts_in=(), topics=()):
+        self.bot_posts_in = set(bot_posts_in)  # {(stream_id, topic)}
+        self.topics = list(topics)  # names for users/me/<id>/topics
+        self.calls = []
+
+    async def get(self, path, params=None):
+        import json
+
+        self.calls.append(("GET", path, params))
+        if path == "messages":
+            narrow = {n["operator"]: n["operand"] for n in json.loads(params["narrow"])}
+            key = (narrow["stream"], narrow["topic"])
+            return {"result": "success", "messages": [{"id": 1}] if key in self.bot_posts_in else []}
+        if path.endswith("/topics"):
+            return {"result": "success", "topics": [{"name": n, "max_id": 1} for n in self.topics]}
+        return {"result": "success"}
+
+    async def post(self, path, data):
+        self.calls.append(("POST", path, data))
+        return {"result": "success", "id": 777}
+
+
+class _RegistryCtx:
+    """Stands in for the plugin loader: registers like PluginContext.register_platform."""
+
+    def register_platform(self, name, label, adapter_factory, check_fn, validate_config=None,
+                          required_env=None, install_hint="", **entry_kwargs):
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        platform_registry.register(PlatformEntry(
+            name=name, label=label, adapter_factory=adapter_factory, check_fn=check_fn,
+            validate_config=validate_config, required_env=required_env or [],
+            install_hint=install_hint, source="plugin", plugin_name="zulip-platform", **entry_kwargs))
+
+
+def test_register_is_accepted_by_core():
+    adapter.register(_RegistryCtx())
+    from gateway.platform_registry import platform_registry
+
+    entry = platform_registry.get("zulip")
+    assert entry.parse_target_ref_fn is adapter.parse_target_ref
+
+
+def _make_adapter(api, monkeypatch):
+    from gateway.config import PlatformConfig
+
+    adapter.register(_RegistryCtx())
+
+    for var in ("ZULIP_REQUIRE_MENTION", "ZULIP_FREE_RESPONSE_TOPICS", "ZULIP_STREAM"):
+        monkeypatch.delenv(var, raising=False)
+    zulip = adapter.ZulipAdapter(PlatformConfig(
+        enabled=True, token="key",
+        extra={"site": "https://example.zulipchat.com", "bot_email": "hermes-bot@example.zulipchat.com"}))
+    zulip._bot_user_id = BOT_ID
+    zulip._bot_full_name = "Hermes Bot"
+    zulip._api_get = api.get
+    zulip._api_post_form = api.post
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    zulip.handle_message = capture
+    return zulip, received
+
+
+def _stream_event(content, topic="general", sender=OWNER_ID, flags=(), msg_id=1001):
+    return {
+        "type": "message",
+        "flags": list(flags),
+        "message": {
+            "id": msg_id, "type": "stream", "stream_id": 42, "subject": topic,
+            "sender_id": sender, "sender_full_name": "Owner", "content": content,
+        },
+    }
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+class TestInboundTopics:
+    def test_stream_message_is_channel_plus_topic_thread(self, monkeypatch):
+        api = _FakeApi()
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>@Hermes Bot hi</p>", flags=["mentioned"])))
+        source = received[0].source
+        assert (source.chat_id, source.chat_type, source.thread_id) == ("zulip:42", "thread", "general")
+
+    def test_unmentioned_message_in_quiet_topic_is_ignored(self, monkeypatch):
+        api = _FakeApi()
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>notes to self</p>")))
+        assert received == []
+
+    def test_unmentioned_message_in_topic_where_bot_posted_is_followed(self, monkeypatch):
+        api = _FakeApi(bot_posts_in={(42, "Morning brief · 2026-11-27 06:00")})
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>tell me more</p>", topic="Morning brief · 2026-11-27 06:00")))
+        assert len(received) == 1
+
+    def test_bot_lookup_is_cached(self, monkeypatch):
+        api = _FakeApi(bot_posts_in={(42, "t")})
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>a</p>", topic="t", msg_id=1)))
+        _run(zulip._handle_event(_stream_event("<p>b</p>", topic="t", msg_id=2)))
+        assert len(received) == 2
+        assert sum(1 for c in api.calls if c[1] == "messages") == 1
+
+    def test_bots_own_message_marks_topic_active(self, monkeypatch):
+        api = _FakeApi()
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>brief</p>", topic="t", sender=BOT_ID, msg_id=1)))
+        _run(zulip._handle_event(_stream_event("<p>reply</p>", topic="t", msg_id=2)))
+        assert len(received) == 1
+        assert not any(c[1] == "messages" for c in api.calls)
+
+    def test_mention_then_follow_without_mention(self, monkeypatch):
+        api = _FakeApi()
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>@Hermes Bot start</p>", topic="t", flags=["mentioned"], msg_id=1)))
+        _run(zulip.send("zulip:42", "answer", metadata={"thread_id": "t"}))
+        _run(zulip._handle_event(_stream_event("<p>and then?</p>", topic="t", msg_id=2)))
+        assert len(received) == 2
+
+    def test_dm_is_unchanged(self, monkeypatch):
+        api = _FakeApi()
+        zulip, received = _make_adapter(api, monkeypatch)
+        event = {"type": "message", "flags": [], "message": {
+            "id": 5, "type": "private", "sender_id": OWNER_ID, "sender_full_name": "Owner", "content": "<p>hi</p>"}}
+        _run(zulip._handle_event(event))
+        source = received[0].source
+        assert (source.chat_id, source.chat_type, source.thread_id) == (f"zulip:dm:{OWNER_ID}", "dm", None)
+
+
+class TestOutboundTopics:
+    def test_send_uses_thread_id_as_topic(self, monkeypatch):
+        api = _FakeApi()
+        zulip, _ = _make_adapter(api, monkeypatch)
+        result = _run(zulip.send("zulip:42", "hello", metadata={"thread_id": "Status"}))
+        assert result.success
+        post = [c for c in api.calls if c[0] == "POST"][-1]
+        assert post[1] == "messages" and post[2]["to"] == "42" and post[2]["topic"] == "Status"
+
+    def test_send_to_legacy_jid_keeps_its_topic(self, monkeypatch):
+        api = _FakeApi()
+        zulip, _ = _make_adapter(api, monkeypatch)
+        _run(zulip.send("zulip:42:Morning brief", "hello"))
+        assert [c for c in api.calls if c[0] == "POST"][-1][2]["topic"] == "Morning brief"
+
+    def test_create_handoff_thread_names_a_fresh_topic(self, monkeypatch):
+        api = _FakeApi(topics=["Morning brief · 2026-11-27 06:00"])
+        zulip, _ = _make_adapter(api, monkeypatch)
+        monkeypatch.setattr(adapter, "_local_now", lambda: __import__("datetime").datetime(2026, 11, 27, 6, 0))
+        topic = _run(zulip.create_handoff_thread("zulip:42", "Hermes — Morning brief"))
+        assert topic == "Morning brief · 2026-11-27 06:00 (2)"
+        assert (42, topic.lower()) in zulip._active_topics
+
+    def test_create_handoff_thread_rejects_dm(self, monkeypatch):
+        api = _FakeApi()
+        zulip, _ = _make_adapter(api, monkeypatch)
+        assert _run(zulip.create_handoff_thread(f"zulip:dm:{OWNER_ID}", "Hermes — x")) is None
+
+
+class TestSessionKeyContinuity:
+    """The cron seed and the user's reply must resolve to the same Hermes session."""
+
+    def test_seeded_brief_and_reply_share_a_session(self, monkeypatch):
+        from gateway.config import Platform
+        from gateway.session import SessionSource, build_session_key
+
+        api = _FakeApi(bot_posts_in={(42, "Morning brief · 2026-11-27 06:00")})
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>more?</p>", topic="Morning brief · 2026-11-27 06:00")))
+        reply_key = build_session_key(received[0].source)
+
+        # What cron/scheduler_delivery._seed_cron_session builds for a fresh thread on a
+        # platform without an entry in _THREAD_REPLY_CHAT_TYPE.
+        seed = SessionSource(
+            platform=Platform("zulip"), chat_id="zulip:42", chat_type="thread",
+            thread_id="Morning brief · 2026-11-27 06:00", user_id="system:cron", user_name="Cron")
+        assert build_session_key(seed) == reply_key

@@ -8,14 +8,16 @@ direct messages.
 - Works with Zulip Cloud and self-hosted servers through the v1 REST API and
   the long-polling event queue. Its only dependency is `aiohttp`; no Zulip SDK
   is needed.
-- Each stream topic and each direct-message partner gets its own Hermes
-  session.
-- Can be limited to a single stream.
-- Requires an @-mention in streams by default, with opt-out topics. Direct
+- Topics work like Slack threads: each topic and each direct-message partner
+  gets its own Hermes session.
+- Follows topics like Slack: once the bot has posted in a topic, it answers
+  every message there. Elsewhere in a stream it needs an @-mention. Direct
   messages always reach the agent.
+- Can be limited to a single stream.
 - Downloads attachments sent to the bot and uploads files the agent sends.
 - Splits replies longer than Zulip's 10,000-character limit.
-- Delivers cron output to a home channel.
+- Delivers cron output to a stream, opening a new topic for each run, so you
+  can reply to a scheduled brief in its own topic.
 - Works under a multi-profile gateway (`gateway.multiplex_profiles`): each
   profile signs in as its own bot.
 
@@ -47,9 +49,9 @@ Set these in the profile's `.env` (or any secret source Hermes supports):
 | `ZULIP_STREAM` | no | Name of the only stream the bot responds in. Without it, the bot responds in every stream it is subscribed to. |
 | `ZULIP_ALLOWED_USERS` | no | Comma-separated Zulip user IDs allowed to talk to the bot |
 | `ZULIP_ALLOW_ALL_USERS` | no | `true` lets any user talk to the bot (development only) |
-| `ZULIP_HOME_CHANNEL` | no | Chat ID for cron output and Hermes status notices, such as the startup notice (see below) |
-| `ZULIP_REQUIRE_MENTION` | no | Require an @-mention in streams (default `true`) |
-| `ZULIP_FREE_RESPONSE_TOPICS` | no | Comma-separated topics where no @-mention is needed |
+| `ZULIP_HOME_CHANNEL` | no | Target for Hermes status notices and for cron jobs that name no target (see below). Leave it unset to send no notices to Zulip (Hermes then suggests `/sethome` at the start of each new conversation). |
+| `ZULIP_REQUIRE_MENTION` | no | Require an @-mention in topics the bot has not posted in (default `true`) |
+| `ZULIP_FREE_RESPONSE_TOPICS` | no | Comma-separated topics where no @-mention is ever needed |
 
 The last three non-secret settings can go in `config.yaml` instead; environment
 variables take precedence:
@@ -62,18 +64,41 @@ zulip:
     - chat
 ```
 
-The bot answers to its username (the part of its email before `@`), its full
-name and its user ID.
+The bot counts as mentioned when Zulip flags the message as mentioning it, or
+when the text contains `@` followed by its username (the part of its email
+before `@`) or full name.
 
-### Chat IDs
+### Topics and following
 
-Hermes addresses Zulip conversations with these chat IDs, which you can use
-for `ZULIP_HOME_CHANNEL` and cron delivery targets:
+Hermes sees a stream as a chat and each topic as a thread in it. A message in a
+topic where the bot has posted reaches Hermes without a mention, so you can
+carry on a conversation the bot started, or one you started with a mention.
+After a restart the bot asks Zulip whether it has posted in a topic, so nothing
+extra is stored.
 
-| Conversation | Chat ID |
+### Delivery targets
+
+Use these targets for cron jobs (`deliver`), `send_message` and
+`ZULIP_HOME_CHANNEL`. A stream can be given by ID or by name.
+
+| Target | Delivers to |
 | --- | --- |
-| Stream topic | `zulip:<stream_id>:<topic>` |
-| Direct message | `zulip:dm:<user_id>` |
+| `zulip:<stream>` | A new topic for each cron run, named `<job name> · YYYY-MM-DD HH:MM` in the host's local time. Other messages go to the topic `Hermes`. |
+| `zulip:<stream>:<topic>` | That topic, every time |
+| `zulip:dm:<user_id>` | A direct message |
+
+Zulip only creates a topic when something is posted to it, so a cron run that
+stays silent leaves no empty topic. If a topic name is already taken, the bot
+adds ` (2)`, ` (3)` and so on.
+
+To reply to a cron brief in its topic with the brief in context, enable
+`attach_to_session` on the job (or `cron.mirror_delivery` in `config.yaml`).
+
+### Upgrading from earlier versions
+
+Topics used to be separate chats (`zulip:<stream_id>:<topic>`); they are now
+threads of the stream chat. Existing topic conversations start a fresh Hermes
+session once after upgrading. Old-style targets keep working.
 
 ## Updating
 
