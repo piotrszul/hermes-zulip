@@ -528,6 +528,14 @@ class TestInboundTopics:
         source = received[0].source
         assert (source.chat_id, source.chat_type, source.thread_id) == ("zulip:42", "thread", "general")
 
+    def test_source_names_channel_and_topic(self, monkeypatch):
+        monkeypatch.setattr(adapter, "_STREAM_NAMES_BY_ID", {42: "sandbox"})
+        api = _FakeApi()
+        zulip, received = _make_adapter(api, monkeypatch)
+        _run(zulip._handle_event(_stream_event("<p>@Hermes Bot hi</p>", flags=["mentioned"])))
+        source = received[0].source
+        assert (source.chat_name, source.chat_topic) == ("sandbox", "general")
+
     def test_unmentioned_message_in_quiet_topic_is_ignored(self, monkeypatch):
         api = _FakeApi()
         zulip, received = _make_adapter(api, monkeypatch)

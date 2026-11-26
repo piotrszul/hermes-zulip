@@ -87,6 +87,8 @@ _THREAD_NAME_PREFIX_RE = re.compile(r"^\s*Hermes\s*[—–-]\s*")
 # Channel name (lower case) -> stream id. Filled on connect from the bot's
 # subscriptions, and on demand when a target names an unknown channel.
 _STREAM_IDS_BY_NAME: Dict[str, int] = {}
+# Stream id -> display name, for telling Hermes which channel a message is in.
+_STREAM_NAMES_BY_ID: Dict[int, str] = {}
 
 # Reconnect backoff for the event-polling loop.
 _RECONNECT_BASE_DELAY = 2.0
@@ -588,6 +590,12 @@ class ZulipAdapter(BasePlatformAdapter):
 
         subs = await self._api_get("users/me/subscriptions")
         _STREAM_IDS_BY_NAME.update(_stream_ids_from_subscriptions(subs))
+        if subs.get("result") == "success":
+            _STREAM_NAMES_BY_ID.update({
+                int(sub["stream_id"]): str(sub["name"])
+                for sub in subs.get("subscriptions", [])
+                if sub.get("name") and sub.get("stream_id") is not None
+            })
 
         if self._stream_name:
             resolved = await self._api_get(
@@ -947,10 +955,12 @@ class ZulipAdapter(BasePlatformAdapter):
             chat_jid = f"zulip:{stream_id}"
             chat_type = "thread"
             thread_id: Optional[str] = topic
+            chat_name: Optional[str] = _STREAM_NAMES_BY_ID.get(stream_id)
         else:
             chat_jid = f"zulip:dm:{msg.get('sender_id')}"
             chat_type = "dm"
             thread_id = None
+            chat_name = msg.get("sender_full_name") or None
 
         # Mention gating for stream messages. DMs always pass through.
         text = html_to_text(msg.get("content", ""))
@@ -1022,6 +1032,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
         source = self.build_source(
             chat_id=chat_jid,
+            chat_name=chat_name,
             chat_type=chat_type,
             user_id=str(msg.get("sender_id", "")) or None,
             user_name=msg.get("sender_full_name", ""),
